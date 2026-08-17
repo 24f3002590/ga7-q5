@@ -5,41 +5,75 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-
+app = FastAPI(
+    title="Corroboration Service",
+    docs_url=None,
+    redoc_url=None,
+)
 
 ALLOWED_TYPES = {"dns", "ct_log", "registry", "archive", "scan"}
 
+INVALID_RESPONSE = {
+    "verdict": "invalid",
+    "confidence": "low",
+    "corroboratingSources": [],
+}
 
-def parse_timestamp(value: Any):
-    if not isinstance(value, str):
+
+def result(verdict: str, confidence: str, ids: list[str]) -> dict:
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "corroboratingSources": sorted(ids),
+    }
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    """
+    Parse an ISO-8601 timestamp.
+
+    The service deliberately does not use the current time anywhere.
+    """
+    if not isinstance(value, str) or not value.strip():
         return None
 
+    text = value.strip()
+
     try:
-        # Support the required ISO-8601 Z form and offsets.
-        text = value.strip()
-        if text.endswith("Z"):
+        # ISO-8601 UTC commonly arrives with Z.
+        if text.endswith(("Z", "z")):
             text = text[:-1] + "+00:00"
 
         dt = datetime.fromisoformat(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+    # Treat a timestamp without an explicit offset as UTC.
+    # This avoids depending on the server's local timezone.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
 
+    try:
         return dt.astimezone(timezone.utc)
-    except (ValueError, TypeError, OverflowError):
+    except (ValueError, OverflowError):
         return None
 
 
-def valid_source(source: Any) -> bool:
+def is_valid_source(source: Any) -> bool:
     if not isinstance(source, dict):
         return False
 
-    required_strings = ("id", "origin", "value", "observedAt")
+    if not isinstance(source.get("id"), str):
+        return False
 
-    for key in required_strings:
-        if not isinstance(source.get(key), str):
-            return False
+    if not isinstance(source.get("origin"), str):
+        return False
+
+    if not isinstance(source.get("value"), str):
+        return False
+
+    if not isinstance(source.get("observedAt"), str):
+        return False
 
     if source.get("type") not in ALLOWED_TYPES:
         return False
@@ -47,112 +81,140 @@ def valid_source(source: Any) -> bool:
     return True
 
 
-def make_response(
-    verdict: str,
-    confidence: str,
-    sources: list[str],
-):
-    return {
-        "verdict": verdict,
-        "confidence": confidence,
-        "corroboratingSources": sorted(sources),
-    }
+def is_fresh(
+    source: dict,
+    as_of: datetime,
+    staleness_days: float,
+) -> bool:
+    observed = parse_datetime(source["observedAt"])
+
+    if observed is None:
+        return False
+
+    age_seconds = (as_of - observed).total_seconds()
+    allowed_seconds = staleness_days * 86400.0
+
+    return age_seconds <= allowed_seconds
+
+
+async def read_json(request: Request) -> Any:
+    try:
+        return await request.json()
+    except Exception:
+        return None
 
 
 @app.post("/corroborate")
 async def corroborate(request: Request):
-    # Never use the wall clock.
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            make_response("invalid", "low", []),
-            status_code=200,
-        )
+    body = await read_json(request)
 
-    # Rule 1: top-level body must be an object.
+    # ------------------------------------------------------------
+    # RULE 1: invalid
+    # ------------------------------------------------------------
+
     if not isinstance(body, dict):
         return JSONResponse(
-            make_response("invalid", "low", []),
+            content=INVALID_RESPONSE,
             status_code=200,
         )
 
     claim = body.get("claim")
 
-    # claim.value must be a string.
-    if not isinstance(claim, dict) or not isinstance(claim.get("value"), str):
+    if not isinstance(claim, dict):
         return JSONResponse(
-            make_response("invalid", "low", []),
+            content=INVALID_RESPONSE,
             status_code=200,
         )
 
-    claim_value = claim["value"]
+    claim_value = claim.get("value")
 
-    # asOf must exist and be parseable.
-    as_of = parse_timestamp(body.get("asOf"))
+    if not isinstance(claim_value, str):
+        return JSONResponse(
+            content=INVALID_RESPONSE,
+            status_code=200,
+        )
+
+    as_of = parse_datetime(body.get("asOf"))
+
     if as_of is None:
         return JSONResponse(
-            make_response("invalid", "low", []),
+            content=INVALID_RESPONSE,
             status_code=200,
         )
 
-    # stalenessDays must be a JSON number, not bool.
     staleness_days = body.get("stalenessDays")
-    if (
-        isinstance(staleness_days, bool)
-        or not isinstance(staleness_days, (int, float))
-        or not isfinite(float(staleness_days))
-    ):
+
+    # bool is a subclass of int in Python, so explicitly reject it.
+    if isinstance(staleness_days, bool):
         return JSONResponse(
-            make_response("invalid", "low", []),
+            content=INVALID_RESPONSE,
             status_code=200,
         )
 
-    # sources must be an array.
+    if not isinstance(staleness_days, (int, float)):
+        return JSONResponse(
+            content=INVALID_RESPONSE,
+            status_code=200,
+        )
+
+    try:
+        staleness_days = float(staleness_days)
+    except (TypeError, ValueError, OverflowError):
+        return JSONResponse(
+            content=INVALID_RESPONSE,
+            status_code=200,
+        )
+
+    if not isfinite(staleness_days):
+        return JSONResponse(
+            content=INVALID_RESPONSE,
+            status_code=200,
+        )
+
     sources = body.get("sources")
+
     if not isinstance(sources, list):
         return JSONResponse(
-            make_response("invalid", "low", []),
+            content=INVALID_RESPONSE,
             status_code=200,
         )
 
-    max_age_seconds = float(staleness_days) * 86400.0
+    # ------------------------------------------------------------
+    # Normalize valid/fresh sources.
+    #
+    # Invalid sources are ignored completely.
+    # ------------------------------------------------------------
 
-    fresh_sources = []
+    fresh = []
 
     for source in sources:
-        # Invalid sources are ignored entirely.
-        if not valid_source(source):
+        if not is_valid_source(source):
             continue
 
-        observed_at = parse_timestamp(source["observedAt"])
-
-        # An otherwise valid source with an unparseable observedAt
-        # cannot establish freshness, so ignore it.
-        if observed_at is None:
+        if not is_fresh(source, as_of, staleness_days):
             continue
 
-        age_seconds = (as_of - observed_at).total_seconds()
+        fresh.append(source)
 
-        # Fresh means:
-        # asOf - observedAt <= stalenessDays
-        #
-        # Do not compare against wall-clock time.
-        if age_seconds <= max_age_seconds:
-            fresh_sources.append(source)
+    # ------------------------------------------------------------
+    # RULE 2: contradicted
+    #
+    # This happens BEFORE support is considered.
+    # Only authoritative + fresh + disagreement counts.
+    # ------------------------------------------------------------
 
-    # Rule 2:
-    # Any fresh authoritative disagreement immediately contradicts.
-    contradicting = [
-        source["id"]
-        for source in fresh_sources
-        if source.get("authoritative") is True
-        and source["value"] != claim_value
-    ]
+    contradicting = []
+
+    for source in fresh:
+        if (
+            source.get("authoritative") is True
+            and source["value"] != claim_value
+        ):
+            contradicting.append(source["id"])
 
     if contradicting:
         return JSONResponse(
-            make_response(
+            content=result(
                 "contradicted",
                 "low",
                 contradicting,
@@ -160,58 +222,82 @@ async def corroborate(request: Request):
             status_code=200,
         )
 
-    # Rule 3:
-    # Keep fresh sources agreeing with the claim.
-    agreeing = [
-        source
-        for source in fresh_sources
-        if source["value"] == claim_value
-    ]
+    # ------------------------------------------------------------
+    # RULE 3: supported
+    #
+    # Keep only fresh agreement.
+    # Then one representative per origin.
+    # Representative = lexicographically smallest ID.
+    # ------------------------------------------------------------
 
-    # One representative per origin.
-    representatives_by_origin = {}
+    representatives: dict[str, dict] = {}
 
-    for source in agreeing:
+    for source in fresh:
+        if source["value"] != claim_value:
+            continue
+
         origin = source["origin"]
 
-        existing = representatives_by_origin.get(origin)
+        current = representatives.get(origin)
 
-        if existing is None or source["id"] < existing["id"]:
-            representatives_by_origin[origin] = source
+        if current is None or source["id"] < current["id"]:
+            representatives[origin] = source
 
-    representatives = list(representatives_by_origin.values())
+    reps = list(representatives.values())
 
-    if len(representatives) >= 2:
-        representative_ids = sorted(
-            source["id"] for source in representatives
-        )
+    if len(reps) >= 2:
+        ids = [source["id"] for source in reps]
 
-        distinct_types = {
-            source["type"] for source in representatives
-        }
+        types = {source["type"] for source in reps}
 
-        confidence = (
-            "high"
-            if len(distinct_types) >= 2
-            else "medium"
-        )
+        if len(types) >= 2:
+            confidence = "high"
+        else:
+            confidence = "medium"
 
         return JSONResponse(
-            make_response(
+            content=result(
                 "supported",
                 confidence,
-                representative_ids,
+                ids,
             ),
             status_code=200,
         )
 
-    # Rule 4.
+    # ------------------------------------------------------------
+    # RULE 4: unverified
+    # ------------------------------------------------------------
+
     return JSONResponse(
-        make_response("unverified", "low", []),
+        content=result(
+            "unverified",
+            "low",
+            [],
+        ),
         status_code=200,
     )
+
+
+# Simple availability endpoint.
+# This does not affect corroboration decisions.
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+# Handle malformed JSON at the application level so that malformed
+# requests still receive the exact required response shape.
+@app.exception_handler(Exception)
+async def unexpected_exception_handler(
+    request: Request,
+    exc: Exception,
+):
+    return JSONResponse(
+        content=INVALID_RESPONSE,
+        status_code=200,
+    )
